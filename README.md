@@ -71,14 +71,17 @@ The following files contain our main contributions:
 
 ```bash
 sudo singularity build barn_submit.sif Singularityfile.def
-Run Simulation
+```
+--------------------------------------------------------------------------------
 
-Example:
+### Run Simulation
 
-./singularity_run.sh ./barn_submit.sif python3 run.py --world_idx 0
+## Example:
+
+- `./singularity_run.sh ./barn_submit.sif python3 run.py --world_idx 0`
 
 
-Expected Output
+## Expected Output
 
 A successful run prints:
 
@@ -89,10 +92,10 @@ Navigation collided with time XX.XXXX (s)
 Navigation timeout with time 100.0000 (s)
 
 
-Usage Workflow
+## Usage Workflow
 
 
-git clone https://github.com/eaz7wk/barn-navigation-submission.git
-cd barn-navigation-submission
-sudo singularity build barn_submit.sif Singularityfile.def
-./singularity_run.sh ./barn_submit.sif python3 run.py --world_idx 0
+- `git clone https://github.com/eaz7wk/barn-navigation-submission.git`
+- `cd barn-navigation-submission`
+- `sudo singularity build barn_submit.sif Singularityfile.def`
+- `./singularity_run.sh ./barn_submit.sif python3 run.py --world_idx 0`
