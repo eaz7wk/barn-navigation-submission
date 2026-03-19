@@ -1,2 +1,7 @@
-***__pycache__
 *.sif
+__pycache__/
+*.pyc
+*.log
+results_*.txt
+run_*.log
+out.txt

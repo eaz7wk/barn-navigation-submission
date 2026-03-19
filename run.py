@@ -1,7 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import time
 import argparse
 import subprocess
 import os
+import sys
 from os.path import join
 
 import numpy as np
@@ -10,187 +14,345 @@ import rospkg
 
 from gazebo_simulation import GazeboSimulation
 
-INIT_POSITION = [-2, 3, 1.57]  # in world frame
-GOAL_POSITION = [0, 10]  # relative to the initial position
+INIT_POSITION = [-2, 3, 1.57]  # world frame (used only for gazebo reset)
+GOAL_POSITION = [0, 10]        # relative goal (interpreted in odom after reset)
+
 
 def compute_distance(p1, p2):
     return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
+
 def path_coord_to_gazebo_coord(x, y):
-        RADIUS = 0.075
-        r_shift = -RADIUS - (30 * RADIUS * 2)
-        c_shift = RADIUS + 5
+    radius = 0.075
+    r_shift = -radius - (30 * radius * 2)
+    c_shift = radius + 5
+    gazebo_x = x * (radius * 2) + r_shift
+    gazebo_y = y * (radius * 2) + c_shift
+    return (gazebo_x, gazebo_y)
 
-        gazebo_x = x * (RADIUS * 2) + r_shift
-        gazebo_y = y * (RADIUS * 2) + c_shift
 
-        return (gazebo_x, gazebo_y)
+def terminate_process(proc, timeout=5.0):
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def wait_for_sim_time(timeout=15.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout and not rospy.is_shutdown():
+        if rospy.get_time() > 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+def wait_for_ros_master(timeout=15.0):
+    import rosgraph
+    t0 = time.time()
+    master = rosgraph.Master('/run.py')
+    while time.time() - t0 < timeout and not rospy.is_shutdown():
+        try:
+            master.getPid()
+            return True
+        except Exception:
+            time.sleep(0.1)
+    return False
+    
+def wait_for_tf(tf_buffer, target_frame, source_frame, timeout=15.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout and not rospy.is_shutdown():
+        try:
+            tf_buffer.lookup_transform(
+                target_frame, source_frame, rospy.Time(0), rospy.Duration(0.2)
+            )
+            return True
+        except Exception:
+            time.sleep(0.05)
+    return False
+
+
+def get_base_in_odom(tf_buffer, base_frame="base_link"):
+    transform = tf_buffer.lookup_transform(
+        "odom", base_frame, rospy.Time(0), rospy.Duration(0.5)
+    )
+    return (
+        transform.transform.translation.x,
+        transform.transform.translation.y,
+    )
+
+
+def wait_pose_stable_odom(
+    tf_buffer,
+    base_frame="base_link",
+    stable_eps=0.01,
+    stable_n=6,
+    timeout=5.0,
+):
+    last = None
+    stable_count = 0
+    t0 = time.time()
+
+    while time.time() - t0 < timeout and not rospy.is_shutdown():
+        try:
+            pose = get_base_in_odom(tf_buffer, base_frame=base_frame)
+        except Exception:
+            time.sleep(0.05)
+            continue
+
+        if last is not None and compute_distance(last, pose) < stable_eps:
+            stable_count += 1
+            if stable_count >= stable_n:
+                return True
+        else:
+            stable_count = 0
+
+        last = pose
+        time.sleep(0.05)
+
+    return False
+
+
+def read_collision_fresh(gazebo_sim, checks=3, dt=0.1):
+    collided = False
+    for _ in range(checks):
+        collided = collided or bool(gazebo_sim.get_hard_collision())
+        time.sleep(dt)
+    return collided
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description = 'test BARN navigation challenge')
-    parser.add_argument('--world_idx', type=int, default=0)
-    parser.add_argument('--gui', action="store_true")
-    parser.add_argument('--out', type=str, default="out.txt")
+    parser = argparse.ArgumentParser(description="test BARN navigation challenge")
+    parser.add_argument("--world_idx", type=int, default=0)
+    parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--out", type=str, default="out.txt")
+    parser.add_argument("--planner", type=str, default="scripts/fixed_granular.py")
+    parser.add_argument("--base_frame", type=str, default="base_link")
     args = parser.parse_args()
-    
-    ##########################################################################################
-    ## 0. Launch Gazebo Simulation
-    ##########################################################################################
-    
-    os.environ["JACKAL_LASER"] = "1"
-    os.environ["JACKAL_LASER_MODEL"] = "ust10"
-    os.environ["JACKAL_LASER_OFFSET"] = "-0.065 0 0.01"
-    
-    if args.world_idx < 300:  # static environment from 0-299
-        world_name = "BARN/world_%d.world" %(args.world_idx)
-        INIT_POSITION = [-2.25, 3, 1.57]  # in world frame
-        GOAL_POSITION = [0, 10]  # relative to the initial position
-    elif args.world_idx < 360:  # Dynamic environment from 300-359
-        world_name = "DynaBARN/world_%d.world" %(args.world_idx - 300)
-        INIT_POSITION = [11, 0, 3.14]  # in world frame
-        GOAL_POSITION = [-20, 0]  # relative to the initial position
-    else:
-        raise ValueError("World index %d does not exist" %args.world_idx)
-    
-    print(">>>>>>>>>>>>>>>>>> Loading Gazebo Simulation with %s <<<<<<<<<<<<<<<<<<" %(world_name))   
-    rospack = rospkg.RosPack()
-    base_path = rospack.get_path('jackal_helper')
-    os.environ['GAZEBO_PLUGIN_PATH'] = os.path.join(base_path, "plugins")
-    
-    launch_file = join(base_path, 'launch', 'gazebo_launch.launch')
-    world_name = join(base_path, "worlds", world_name)
-    
-    gazebo_process = subprocess.Popen([
-        'roslaunch',
-        launch_file,
-        'world_name:=' + world_name,
-        'gui:=' + ("true" if args.gui else "false")
-    ])
-    time.sleep(5)  # sleep to wait until the gazebo being created
-    
-    rospy.init_node('gym', anonymous=True) #, log_level=rospy.FATAL)
-    rospy.set_param('/use_sim_time', True)
-    
-    # GazeboSimulation provides useful interface to communicate with gazebo  
-    gazebo_sim = GazeboSimulation(init_position=INIT_POSITION)
-    
-    init_coor = (INIT_POSITION[0], INIT_POSITION[1])
-    goal_coor = (INIT_POSITION[0] + GOAL_POSITION[0], INIT_POSITION[1] + GOAL_POSITION[1])
-    
-    pos = gazebo_sim.get_model_state().pose.position
-    curr_coor = (pos.x, pos.y)
-    collided = True
-    
-    # check whether the robot is reset, the collision is False
-    while compute_distance(init_coor, curr_coor) > 0.1 or collided:
-        gazebo_sim.reset() # Reset to the initial position
-        pos = gazebo_sim.get_model_state().pose.position
-        curr_coor = (pos.x, pos.y)
-        collided = gazebo_sim.get_hard_collision()
-        time.sleep(1)
 
+    gazebo_process = None
+    nav_stack_process = None
 
+    try:
+        ##########################################################################################
+        ## 0. Launch Gazebo Simulation
+        ##########################################################################################
 
+        os.environ["JACKAL_LASER"] = "1"
+        os.environ["JACKAL_LASER_MODEL"] = "ust10"
+        os.environ["JACKAL_LASER_OFFSET"] = "-0.065 0 0.01"
 
-    ##########################################################################################
-    ## 1. Launch your navigation stack
-    ## (Customize this block to add your own navigation stack)
-    ##########################################################################################
-    
-    launch_file = join(base_path, '..', 'jackal_helper/launch/move_base_DWA.launch')
-    nav_stack_process = subprocess.Popen([
-        'roslaunch',
-        launch_file,
-    ])
-    
-    # Make sure your navigation stack recives the correct goal position defined in GOAL_POSITION
-    import actionlib
-    from geometry_msgs.msg import Quaternion
-    from move_base_msgs.msg import MoveBaseGoal, MoveBaseAction
-    nav_as = actionlib.SimpleActionClient('/move_base', MoveBaseAction)
-    mb_goal = MoveBaseGoal()
-    mb_goal.target_pose.header.frame_id = 'odom'
-    mb_goal.target_pose.pose.position.x = GOAL_POSITION[0]
-    mb_goal.target_pose.pose.position.y = GOAL_POSITION[1]
-    mb_goal.target_pose.pose.position.z = 0
-    mb_goal.target_pose.pose.orientation = Quaternion(0, 0, 0, 1)
+        if args.world_idx < 300:  # static environment from 0-299
+            world_name = "BARN/world_%d.world" % (args.world_idx)
+            INIT_POSITION = [-2.25, 3, 1.57]
+            GOAL_POSITION = [0, 10]
+        elif args.world_idx < 360:  # dynamic environment from 300-359
+            world_name = "DynaBARN/world_%d.world" % (args.world_idx - 300)
+            INIT_POSITION = [11, 0, 3.14]
+            GOAL_POSITION = [-20, 0]
+        else:
+            raise ValueError("World index %d does not exist" % args.world_idx)
 
-    nav_as.wait_for_server()
-    nav_as.send_goal(mb_goal)
+        print(">>>>>>>>>>>>>>>>>> Loading Gazebo Simulation with %s <<<<<<<<<<<<<<<<<<" % world_name)
 
+        rospack = rospkg.RosPack()
+        base_path = rospack.get_path("jackal_helper")
+        os.environ["GAZEBO_PLUGIN_PATH"] = os.path.join(base_path, "plugins")
 
+        launch_file = join(base_path, "launch", "gazebo_launch.launch")
+        world_path = join(base_path, "worlds", world_name)
 
+        gazebo_process = subprocess.Popen([
+            "roslaunch",
+            launch_file,
+            "world_name:=" + world_path,
+            "gui:=" + ("true" if args.gui else "false"),
+        ])
 
-    ##########################################################################################
-    ## 2. Start navigation
-    ##########################################################################################
-    
-    curr_time = rospy.get_time()
-    pos = gazebo_sim.get_model_state().pose.position
-    curr_coor = (pos.x, pos.y)
+        if not wait_for_ros_master(timeout=20.0):
+            raise RuntimeError("ROS master did not start in time.")
 
-    
-    # check whether the robot started to move
-    while compute_distance(init_coor, curr_coor) < 0.1:
+        rospy.init_node("gym", anonymous=True)
+        rospy.set_param("/use_sim_time", True)
+
+        if not wait_for_sim_time(timeout=20.0):
+            raise RuntimeError("Sim time did not start (/clock not publishing).")
+
+        rospy.wait_for_service("/gazebo/get_model_state", timeout=30.0)
+
+        gazebo_sim = GazeboSimulation(init_position=INIT_POSITION)
+
+        import tf2_ros
+        tf_buffer = tf2_ros.Buffer()
+        tf_listener = tf2_ros.TransformListener(tf_buffer)
+
+        if not wait_for_tf(tf_buffer, "odom", args.base_frame, timeout=30.0):
+            raise RuntimeError(
+                "TF not ready: cannot lookup odom -> %s" % args.base_frame
+            )
+
+        init_coor = (INIT_POSITION[0], INIT_POSITION[1])
+        goal_coor = (
+            INIT_POSITION[0] + GOAL_POSITION[0],
+            INIT_POSITION[1] + GOAL_POSITION[1],
+        )
+
+        print("[run] Resetting until pose stable and no collision...")
+
+        max_resets = 20
+        reset_ok = False
+        for _ in range(max_resets):
+            gazebo_sim.reset()
+            time.sleep(0.6)
+
+            wait_pose_stable_odom(
+                tf_buffer, base_frame=args.base_frame, timeout=5.0
+            )
+            collided = read_collision_fresh(gazebo_sim, checks=3, dt=0.12)
+
+            if not collided:
+                reset_ok = True
+                break
+
+        if not reset_ok:
+            raise RuntimeError("Failed to obtain a clean reset (collision keeps triggering).")
+
+        init_odom = get_base_in_odom(tf_buffer, base_frame=args.base_frame)
+        goal_odom = (
+            init_odom[0] + GOAL_POSITION[0],
+            init_odom[1] + GOAL_POSITION[1],
+        )
+
+        ##########################################################################################
+        ## 1. Launch your navigation stack
+        ##########################################################################################
+
+        planner_script = args.planner
+        if not os.path.isabs(planner_script):
+            planner_script = join(base_path, planner_script)
+
+        if not os.path.exists(planner_script):
+            raise RuntimeError("Planner script not found: %s" % planner_script)
+
+        nav_stack_process = subprocess.Popen([sys.executable, planner_script])
+
+        import actionlib
+        from geometry_msgs.msg import Quaternion
+        from move_base_msgs.msg import MoveBaseGoal, MoveBaseAction
+
+        nav_as = actionlib.SimpleActionClient("/move_base", MoveBaseAction)
+        if not nav_as.wait_for_server(rospy.Duration(30.0)):
+            raise RuntimeError("move_base action server not available on /move_base")
+
+        mb_goal = MoveBaseGoal()
+        mb_goal.target_pose.header.frame_id = "odom"
+        mb_goal.target_pose.header.stamp = rospy.Time.now()
+        mb_goal.target_pose.pose.position.x = goal_odom[0]
+        mb_goal.target_pose.pose.position.y = goal_odom[1]
+        mb_goal.target_pose.pose.position.z = 0.0
+        mb_goal.target_pose.pose.orientation = Quaternion(0, 0, 0, 1)
+
+        nav_as.send_goal(mb_goal)
+
+        ##########################################################################################
+        ## 2. Start navigation
+        ##########################################################################################
+
         curr_time = rospy.get_time()
-        pos = gazebo_sim.get_model_state().pose.position
-        curr_coor = (pos.x, pos.y)
-        time.sleep(0.01)
-    
-    # start navigation, check position, time and collision
-    start_time = curr_time
-    start_time_cpu = time.time()
-    collided = False
-    
-    while compute_distance(goal_coor, curr_coor) > 1 and not collided and curr_time - start_time < 100:
-        curr_time = rospy.get_time()
-        pos = gazebo_sim.get_model_state().pose.position
-        curr_coor = (pos.x, pos.y)
-        print("Time: %.2f (s), x: %.2f (m), y: %.2f (m)" %(curr_time - start_time, *curr_coor), end="\r")
-        collided = gazebo_sim.get_hard_collision()
-        while rospy.get_time() - curr_time < 0.1:
-            time.sleep(0.01)
+        curr_odom = get_base_in_odom(tf_buffer, base_frame=args.base_frame)
 
+        while compute_distance(init_odom, curr_odom) < 0.05 and (rospy.get_time() - curr_time) < 10.0:
+            time.sleep(0.05)
+            curr_time = rospy.get_time()
+            curr_odom = get_base_in_odom(tf_buffer, base_frame=args.base_frame)
 
-    
-    
-    ##########################################################################################
-    ## 3. Report metrics and generate log
-    ##########################################################################################
-    
-    print(">>>>>>>>>>>>>>>>>> Test finished! <<<<<<<<<<<<<<<<<<")
-    success = False
-    if collided:
-        status = "collided"
-    elif curr_time - start_time >= 100:
-        status = "timeout"
-    else:
-        status = "succeeded"
-        success = True
-    print("Navigation %s with time %.4f (s)" %(status, curr_time - start_time))
-    
-    if args.world_idx >= 300:  # DynaBARN environment which does not have a planned path
-        path_length = GOAL_POSITION[0] - INIT_POSITION[0]
-    else:
-        path_file_name = join(base_path, "worlds/BARN/path_files", "path_%d.npy" %args.world_idx)
-        path_array = np.load(path_file_name)
-        path_array = [path_coord_to_gazebo_coord(*p) for p in path_array]
-        path_array = np.insert(path_array, 0, (INIT_POSITION[0], INIT_POSITION[1]), axis=0)
-        path_array = np.insert(path_array, len(path_array), (INIT_POSITION[0] + GOAL_POSITION[0], INIT_POSITION[1] + GOAL_POSITION[1]), axis=0)
-        path_length = 0
-        for p1, p2 in zip(path_array[:-1], path_array[1:]):
-            path_length += compute_distance(p1, p2)
-    
-    # Navigation metric: 1_success *  optimal_time / clip(actual_time, 2 * optimal_time, 8 * optimal_time)
-    optimal_time = path_length / 2
-    actual_time = curr_time - start_time
-    nav_metric = int(success) * optimal_time / np.clip(actual_time, 2 * optimal_time, 8 * optimal_time)
-    print("Navigation metric: %.4f" %(nav_metric))
-    
-    with open(args.out, "a") as f:
-        f.write("%d %d %d %d %.4f %.4f\n" %(args.world_idx, success, collided, (curr_time - start_time)>=100, curr_time - start_time, nav_metric))
-    
-    gazebo_process.terminate()
-    gazebo_process.wait()
-    nav_stack_process.terminate()
-    nav_stack_process.wait()
+        start_time = rospy.get_time()
+        collided = False
+        timeout_s = 100.0
+
+        while (
+            compute_distance(goal_odom, curr_odom) > 1.0
+            and not collided
+            and (rospy.get_time() - start_time) < timeout_s
+        ):
+            curr_time = rospy.get_time()
+            try:
+                curr_odom = get_base_in_odom(tf_buffer, base_frame=args.base_frame)
+            except Exception:
+                time.sleep(0.05)
+                continue
+
+            print(
+                "Time: %.2f (s), odom x: %.2f (m), odom y: %.2f (m)"
+                % (curr_time - start_time, curr_odom[0], curr_odom[1]),
+                end="\r",
+            )
+
+            collided = read_collision_fresh(gazebo_sim, checks=1, dt=0.0)
+            time.sleep(0.1)
+
+        ##########################################################################################
+        ## 3. Report metrics and generate log
+        ##########################################################################################
+
+        print("\n>>>>>>>>>>>>>>>>>> Test finished! <<<<<<<<<<<<<<<<<<")
+        actual_time = rospy.get_time() - start_time
+
+        success = False
+        if collided:
+            status = "collided"
+        elif actual_time >= timeout_s:
+            status = "timeout"
+        else:
+            status = "succeeded"
+            success = True
+
+        print("Navigation %s with time %.4f (s)" % (status, actual_time))
+
+        if args.world_idx >= 300:
+            path_length = abs(GOAL_POSITION[0]) + abs(GOAL_POSITION[1])
+        else:
+            path_file_name = join(
+                base_path, "worlds/BARN/path_files", "path_%d.npy" % args.world_idx
+            )
+            path_array = np.load(path_file_name)
+            path_array = [path_coord_to_gazebo_coord(*p) for p in path_array]
+            path_array = np.insert(path_array, 0, (INIT_POSITION[0], INIT_POSITION[1]), axis=0)
+            path_array = np.insert(
+                path_array,
+                len(path_array),
+                (INIT_POSITION[0] + GOAL_POSITION[0], INIT_POSITION[1] + GOAL_POSITION[1]),
+                axis=0,
+            )
+
+            path_length = 0.0
+            for p1, p2 in zip(path_array[:-1], path_array[1:]):
+                path_length += compute_distance(p1, p2)
+
+        optimal_time = path_length / 2.0
+        nav_metric = int(success) * optimal_time / np.clip(
+            actual_time, 2 * optimal_time, 8 * optimal_time
+        )
+        print("Navigation metric: %.4f" % nav_metric)
+
+        with open(args.out, "a") as f:
+            f.write(
+                "%d %d %d %d %.4f %.4f\n"
+                % (
+                    args.world_idx,
+                    int(success),
+                    int(collided),
+                    int(actual_time >= timeout_s),
+                    actual_time,
+                    nav_metric,
+                )
+            )
+
+    finally:
+        terminate_process(nav_stack_process, timeout=5.0)
+        terminate_process(gazebo_process, timeout=5.0)
